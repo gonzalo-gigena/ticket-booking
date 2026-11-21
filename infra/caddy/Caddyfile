@@ -1,0 +1,15 @@
+import /common/caddy/snippets.caddy
+
+{$SITE_ADDRESS} {
+	encode zstd gzip
+
+	# /metrics, /healthz and /readyz are never routed here, so they stay internal.
+	handle /api/* {
+		import lb api 8080
+	}
+
+	handle {
+		root * /srv
+		file_server
+	}
+}

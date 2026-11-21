@@ -1,0 +1,6 @@
+# Dev only, loaded automatically. Use with `docker compose up --watch`.
+services:
+  api:
+    command: ["node", "--watch", "src/server.js"]
+    environment:
+      NODE_ENV: development
