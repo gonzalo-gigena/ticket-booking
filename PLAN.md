@@ -119,3 +119,69 @@ Assert with SQL: exactly 100 seats held/sold, every seat has at most one
 - `api` and `worker` are stateless. Postgres row locks are the correctness
   mechanism *and* the bottleneck. That tradeoff is the story of the README.
 - Never store card data. The provider's hosted checkout handles it (PCI scope stays tiny).
+
+## Beyond the plan
+
+Build these after the phases above. Each starts from a problem real systems hit, and
+each should add a row to the README's Decisions & tradeoffs table. If one wouldn't,
+skip it. B1 is the one to build first.
+
+### B1 — Gate scanning with bad connectivity
+**Why:** stadium Wi-Fi fails when 40,000 people arrive at once, and the gates can't stop.
+1. A scanner app (a PWA is enough) checks the QR's signature offline with the public key,
+   and keeps a local log of scans with a per-scanner sequence number.
+2. Scanners sync whenever they can. The server merges the logs and detects a ticket
+   scanned at two gates (a shared screenshot). Scanner clocks drift, so don't pretend
+   timestamps order the scans: flag both for staff review.
+3. Scanners pull a revocation list (refunded or transferred tickets) whenever they're
+   online, and reject those tickets while offline.
+4. A gate dashboard: scans per minute, scanners offline, duplicates flagged.
+- **Done when:** a test runs 4 simulated scanners partitioned for 10 minutes. The same
+  ticket scanned at 2 gates is flagged on reconnect, and a ticket refunded before the
+  partition is rejected by every scanner that had synced the list.
+
+### B2 — Best available, seats together
+**Why:** most buyers don't click seats. They ask for "4 together, best under $X", and
+two of them often want the same row.
+1. `POST /holds/best {event_id, quantity, max_price}`: find contiguous runs of free seats
+   in one row, best first, from the seat cache.
+2. Skip blocks that would leave a single seat stranded between two sold ones, since
+   nobody buys it alone.
+3. Lock a candidate block with `FOR UPDATE SKIP LOCKED`. If fewer rows come back than
+   requested, release them and try the next block instead of waiting.
+- **Done when:** a group variant of `hold_race` (1,000 clients asking for 2–6 seats)
+  never splits a group, and the README reports the stranded-seat rate.
+
+### B3 — Event cancelled: refund everyone
+**Why:** the artist cancels. 50,000 orders must be refunded through a provider that
+allows N refunds per second, and the job will crash halfway at least once.
+1. "Cancel event" in admin creates one refund job per order, with the refund's
+   idempotency key = order ID.
+2. Throttle to the provider's rate limit and retry 429/5xx with backoff. Refunds that
+   fail for good land in a list in the admin panel.
+3. Progress in admin (refunded / pending / failed). The cancellation email goes out
+   once per order, after its refund succeeds.
+4. Extend `payments-mock` (in common) with a refund rate limit and random failures.
+- **Done when:** killing the worker mid-run and restarting it ends with every order
+  refunded exactly once, checked against the mock's ledger, and one email per buyer.
+
+### B4 — Lottery instead of first come, first served
+**Why:** a first-come waiting room rewards bots and fast connections. For the biggest
+on-sales, the fair version is a draw.
+1. Registration window: one entry per verified account, with the requested quantity.
+2. Draw: shuffle the entries with a seed. Publish the seed's hash before the draw and
+   the seed after, so anyone can rerun the draw and check the result.
+3. Winners get an invitation good for a purchase window (e.g. 24 h). Seats left unsold
+   go to the next wave.
+4. Each event picks its mode: waiting room or lottery.
+- **Done when:** the draw is reproducible from the published seed, and seats unsold in
+  wave 1 are offered in wave 2.
+
+### B5 — Ticket transfer and capped resale
+**Why:** buyers who can't go resell elsewhere at 5× the price, and fake screenshots circulate.
+1. Transfer to another account bumps `tickets.version` and re-signs the QR with it, so the
+   old QR stops working. The old version goes on the scanners' revocation list (B1).
+2. Resale on the platform, capped at face value plus a fee. The ticket moves and the
+   seller's payout is recorded in the same transaction as the buyer's payment.
+- **Done when:** after a transfer, the old QR is rejected at the gate, offline scanners
+  included, and no resale can exceed the cap.
