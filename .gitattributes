@@ -1,0 +1,2 @@
+# LF everywhere: CRLF from a Windows checkout breaks shell scripts inside Linux containers.
+* text=auto eol=lf

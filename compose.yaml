@@ -1,0 +1,106 @@
+# Base stack: prod-like. Dev: `docker compose up --watch` (also loads compose.override.yaml if present).
+# Shared pieces come from the `common` submodule (portfolio-common).
+include:
+  - path: common/observability/compose.yaml
+    env_file: .env
+  - path: common/fakes/payments/compose.yaml
+    env_file: .env
+  - path: common/fakes/mail/compose.yaml
+    env_file: .env
+x-db-url: &db-url postgres://${POSTGRES_USER:?copy .env.example to .env}:${POSTGRES_PASSWORD:?copy .env.example to .env}@db:5432/${POSTGRES_DB:?copy .env.example to .env}?sslmode=disable
+
+services:
+  caddy:
+    image: caddy:2.11-alpine
+    ports:
+      - "${HTTP_PORT:-8080}:8080"
+    environment:
+      SITE_ADDRESS: ${SITE_ADDRESS:-:8080}
+    volumes:
+      - ./infra/caddy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - ./common/caddy:/common/caddy:ro
+      - ./apps/web:/srv:ro
+      - caddy_data:/data
+    depends_on:
+      api:
+        condition: service_healthy
+    mem_limit: 128m
+    restart: unless-stopped
+
+  # Scalable: no container_name, no host ports. `docker compose up --scale api=3`.
+  api:
+    build: ./apps/api
+    environment:
+      DATABASE_URL: *db-url
+    init: true
+    stop_grace_period: 15s
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://localhost:8080/readyz').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
+    develop:
+      watch:
+        - action: sync
+          path: ./apps/api/src
+          target: /app/src
+        - action: rebuild
+          path: ./apps/api/package.json
+    depends_on:
+      db:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    mem_limit: 256m
+    restart: unless-stopped
+
+  db:
+    image: postgres:17.12-alpine
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 3s
+      timeout: 3s
+      retries: 10
+    mem_limit: 512m
+    restart: unless-stopped
+
+  migrate:
+    image: migrate/migrate:v4.20.1
+    volumes:
+      - ./infra/db/migrations:/migrations:ro
+    command: ["-path=/migrations", "-database", *db-url, "up"]
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: "no"
+
+  # docker compose run --rm seed
+  seed:
+    image: postgres:17.12-alpine
+    profiles: [tools]
+    volumes:
+      - ./infra/db/seed.sql:/seed.sql:ro
+    command: ["psql", *db-url, "-v", "ON_ERROR_STOP=1", "-f", "/seed.sql"]
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+
+  # sh common/scripts/scale.sh, or: docker compose --profile loadtest run --rm k6 run /scripts/main.js
+  k6:
+    image: grafana/k6:2.4.0
+    profiles: [loadtest]
+    volumes:
+      - ./infra/loadtest:/scripts:ro
+    environment:
+      BASE_URL: http://caddy:8080
+
+volumes:
+  pgdata:
+  caddy_data:

@@ -1,0 +1,33 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Template up</title>
+  <style>
+    :root { color-scheme: light dark; font-family: system-ui, sans-serif; }
+    body { max-width: 40rem; margin: 4rem auto; padding: 0 1rem; line-height: 1.5; }
+    code { font-size: 1.1em; }
+  </style>
+</head>
+<body>
+  <h1>It runs.</h1>
+  <p>Message from the database: <code id="msg">…</code></p>
+  <p>Served by api replica: <code id="replica">…</code></p>
+  <p>Run <code>docker compose up -d --scale api=3</code> and watch the replica change.</p>
+  <script>
+    async function tick() {
+      try {
+        const r = await fetch('/api/hello');
+        const body = await r.json();
+        document.getElementById('msg').textContent = body.message ?? '(no rows, run: docker compose run --rm seed)';
+        document.getElementById('replica').textContent = body.replica;
+      } catch {
+        document.getElementById('replica').textContent = 'api unreachable';
+      }
+    }
+    tick();
+    setInterval(tick, 1000);
+  </script>
+</body>
+</html>
