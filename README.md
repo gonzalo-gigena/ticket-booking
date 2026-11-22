@@ -4,7 +4,7 @@ Thousands of buyers compete for a fixed number of seats, and no seat is ever sol
 
 The step-by-step build plan is in [PLAN.md](PLAN.md).
 
-> **Status:** skeleton. The stack runs, scales and passes CI. The product itself isn't built yet.
+> **Status:** Phase 1. Accounts, one seeded event and a 5,000-seat map work. Holds, payments and the waiting room aren't built yet.
 
 ## Run it
 
@@ -20,12 +20,15 @@ automatically (Compose Watch). On Windows, clone inside the WSL filesystem, not 
 
 Cloned without `--recurse-submodules`? Run `git submodule update --init`.
 
+The seat map is empty until you seed it: `docker compose run --rm seed`.
+
 ## Everyday commands
 
 | What | Command |
 |---|---|
 | Seed demo data | `docker compose run --rm seed` |
 | SQL shell | `docker compose exec db psql -U app app` |
+| Make a user an admin (then log in again) | `docker compose exec db psql -U app app -c "UPDATE users SET role='admin' WHERE email='you@example.com'"` |
 | Scale the api | `docker compose up -d --scale api=3` |
 | Prove scaling works | `sh common/scripts/smoke.sh 3` |
 | Run exactly what CI runs | `sh common/scripts/ci-stack.sh 3` |
@@ -46,6 +49,16 @@ Full reference: [`common/README.md`](common/README.md).
 | `payments-mock` | Fake payment provider. Checkout pages at http://localhost:8090. The api calls `http://payments-mock:8090`, and webhooks go to `PAYMENTS_WEBHOOK_URL`. |
 | `mailpit` | Catches all email. Send to `smtp://mailpit:1025`, read at http://localhost:8025. |
 
+## API
+
+| Route | What |
+|---|---|
+| `POST /api/register`, `POST /api/login` | JSON `{email, password}`. Sets the `sid` cookie. |
+| `POST /api/logout` | Deletes the session. |
+| `GET /api/me` | The session's user ID and role, or 401. |
+| `GET /api/events` | Public, cached for 1.5 s. |
+| `GET /api/seats?event=1` | Public, cached for 1.5 s. Each seat is `[id, section, row, number, price_cents, status]`, status 0 available, 1 held, 2 sold. |
+
 ## Architecture
 
 ```mermaid
@@ -56,7 +69,7 @@ flowchart LR
     web["web<br/>Next.js"]
     api["api ×N<br/>holds, orders, webhooks"]
     worker["worker ×N<br/>expiry, refunds, email"]
-    redis[("Redis<br/>waiting room, seat cache, pub/sub")]
+    redis[("Redis<br/>sessions, seat cache")]
     bouncer["PgBouncer"]
     db[("Postgres<br/>seats, holds, orders")]
     pay["payments-mock<br/>(fake provider)"]
@@ -69,12 +82,12 @@ flowchart LR
   api -->|"direct today"| db
   api -.-> bouncer
   bouncer -.-> db
-  api -.->|"queue position, cache"| redis
+  api -->|"sessions, cache"| redis
   api -.->|"create checkout"| pay
   pay -.->|"signed webhook"| api
   worker -.-> db
   worker -.-> mail
-  class web,worker,redis,bouncer planned
+  class web,worker,bouncer planned
   classDef planned stroke-dasharray: 5 5
 ```
 
@@ -84,10 +97,12 @@ Postgres row locks decide who gets each seat. Everything in front of Postgres (t
 
 ## Stack
 
-- **api:** Node 26 (`node:http` + `pg`), plain JavaScript. Stateless, so it scales with `--scale api=N`.
+- **api:** Node 26 (`node:http`, `pg`, `redis`), plain JavaScript. Stateless, so it scales with `--scale api=N`.
 - **Caddy:** the only service with a host port. It load-balances `/api/*` across every
   replica (`import lb api 8080`, from common) and serves `apps/web`.
 - **Postgres 18:** migrations run once before the api starts (`golang-migrate`).
+- **Redis 8:** sessions and the seat-map cache. No volume yet, so recreating it logs everyone out.
+- **apps/web:** one static HTML file with an SVG seat map.
 - **common/:** git submodule with the shared fakes, scripts, Caddy snippet and Prometheus.
   See [portfolio-common](common/README.md).
 
@@ -110,6 +125,9 @@ profile. Caddy gets TLS automatically. CI pushes multi-arch images to GHCR on ev
 | Payments | Hosted checkout and a signed webhook. Idempotency key = hold ID. Webhooks stored with `UNIQUE (provider, event_id)` and processed by the worker | Taking card details in our own form, or processing webhooks inline | Card data never touches the app. Double clicks and webhook replays are no-ops. Answering 200 fast stops provider retries from piling up. |
 | Payment after the hold expired | Take the seats if they're still free, otherwise refund automatically and email the buyer | Rejecting the webhook | The money already moved, and rejecting the webhook doesn't give it back. Pending orders are also polled, because webhooks get lost. |
 | Traffic spikes | A waiting room: a Redis sorted set, and an admitter that lets N users/s through with single-use tokens | Autoscaling into the spike | The bottleneck is seat-row locks, not api CPU, so more replicas would just queue on Postgres. Cost: Redis needs AOF on, so a restart mid-sale doesn't empty the queue. |
+| Passwords | argon2id from `node:crypto` (19 MiB, 2 passes), stored as PHC strings | The `argon2` npm package, bcrypt | No native dependency to build for two architectures, and the format is portable. Cost: each login takes 19 MiB and tens of milliseconds of CPU. |
+| Sessions | Random token in an HttpOnly, SameSite=Lax cookie. Redis stores its SHA-256 | JWTs | Logout revokes at once, and a leaked Redis dump holds no usable cookies. Cost: a role change applies at the next login, and Redis must be up. |
+| Seat-map cache | Whole response as one JSON string in Redis for 1.5 s, one refill query at a time per replica | A key per seat, or invalidating on write | A hit never parses 5,000 seats, and N replicas send at most about N queries per 1.5 s per event. Cost: the map can be 1.5 s stale until Phase 5. With Redis down, browsing fails instead of falling through to Postgres. |
 | Payment provider in dev and CI | `payments-mock` from `common/`: checkout page, HMAC-signed webhooks, retries, out-of-order delivery | Stripe or Mercado Pago test mode by default | Runs with no account and no public URL for webhooks. A real provider in test mode is selected by env var. |
 | Load balancing | Caddy `dynamic a` upstreams (the `lb` snippet in `common/`) | `reverse_proxy api:8080`, Traefik | Caddy re-reads Docker DNS every 5 s, so `--scale api=N` needs no config change and no Docker socket mount. A plain `reverse_proxy api:8080` is a single upstream to Caddy and doesn't reliably spread load. |
 | Migrations | A one-shot `migrate` service that finishes before the api starts | Each replica migrating on boot | Replicas starting together would race on the same migration. |
@@ -118,9 +136,41 @@ Rows for parts that aren't built yet record the plan's choice. Each one gets con
 
 ## Scaling
 
-### Measured
+### Measured: seat map with 5,000 seats (target: under 200 ms)
 
-The skeleton only, not the product yet: k6 with 20 virtual users for 20 s against `GET /api/hello`, which reads one row from Postgres through Caddy. Run on an Apple M1 laptop with 8 CPUs and 8 GB given to Docker, with the dev override left out:
+**p95 is 86–91 ms from the cache and 118–134 ms on a cache miss, with the laptop moderately busy.** That is navigation start to painted seats in headless Chrome 158 on an Apple M1, HTTP cache off, through Caddy to 1 api replica, with no network latency. Each run is 30 loads per row. Other Docker projects shared the machine, so all three runs are shown:
+
+| Run | Load average at start (8 CPUs) | Cache | p50 | p95 | Under 200 ms |
+|---|---|---|---|---|---|
+| 1 | 6.5 | hit | 52 ms | 91 ms | 30/30 |
+| 1 | 6.5 | miss | 79 ms | 118 ms | 30/30 |
+| 2 | 11.4 | hit | 57 ms | 86 ms | 30/30 |
+| 2 | 11.4 | miss | 83 ms | 134 ms | 30/30 |
+| 3 | 10.5, another container at 400% CPU | hit | 53 ms | 76 ms | 30/30 |
+| 3 | 10.5, another container at 400% CPU | miss | 107 ms | **395 ms** | 26/30 |
+
+Where the target is missed:
+
+- **The first load in a just-started browser:** 277, 161 and 234 ms in those runs.
+- **An oversubscribed host:** at load average 16–31, misses reached p95 477–526 ms and hits 161–276 ms.
+
+`GET /api/seats?event=1` alone (117 KB, 25 KB gzipped):
+
+| Test | p50 | p95 |
+|---|---|---|
+| curl, cache miss (50 requests, 1.7 s apart) | 38 ms | 98 ms |
+| curl, mostly cache hits (100 in a row) | 18 ms | 56 ms |
+| k6, 20 virtual users for 20 s: 739 req/s, 0 failed | 21 ms | 62 ms |
+
+600 seat-map requests in about 4 s caused 6 scans of `seats` in Postgres, with 3 replicas. The page shows its own load time next to the legend. To repeat the k6 row:
+
+```bash
+COMPOSE_FILE=compose.yaml docker compose --profile loadtest run --rm -e "URL_PATH=/api/seats?event=1" k6 run /scripts/main.js
+```
+
+### Measured: the skeleton
+
+The Phase 0 baseline: k6 with 20 virtual users for 20 s against `GET /api/hello`, which reads one row from Postgres through Caddy. Run on an Apple M1 laptop with 8 CPUs and 8 GB given to Docker, with the dev override left out:
 
 ```bash
 COMPOSE_FILE=compose.yaml sh common/scripts/scale.sh
