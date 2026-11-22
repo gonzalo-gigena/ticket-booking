@@ -13,6 +13,6 @@ export const options = {
 };
 
 export default function () {
-  const res = http.get(`${BASE}/api/hello`);
+  const res = http.get(`${BASE}${__ENV.URL_PATH || '/api/hello'}`);
   check(res, { 'status is 200': (r) => r.status === 200 });
 }

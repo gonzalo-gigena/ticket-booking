@@ -32,6 +32,8 @@ services:
     build: ./apps/api
     environment:
       DATABASE_URL: *db-url
+      REDIS_URL: redis://redis:6379
+      COOKIE_SECURE: ${COOKIE_SECURE:-false}
     init: true
     stop_grace_period: 15s
     healthcheck:
@@ -49,6 +51,8 @@ services:
           path: ./apps/api/package.json
     depends_on:
       db:
+        condition: service_healthy
+      redis:
         condition: service_healthy
       migrate:
         condition: service_completed_successfully
@@ -69,6 +73,17 @@ services:
       timeout: 3s
       retries: 10
     mem_limit: 512m
+    restart: unless-stopped
+
+  # Sessions and the seat-map cache. Phase 4 turns on AOF for the waiting room.
+  redis:
+    image: redis:8.10.3-alpine
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 3s
+      timeout: 3s
+      retries: 10
+    mem_limit: 128m
     restart: unless-stopped
 
   migrate:

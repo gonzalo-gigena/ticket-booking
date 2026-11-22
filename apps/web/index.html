@@ -3,31 +3,98 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Template up</title>
+  <title>Ticket booking</title>
   <style>
     :root { color-scheme: light dark; font-family: system-ui, sans-serif; }
-    body { max-width: 40rem; margin: 4rem auto; padding: 0 1rem; line-height: 1.5; }
-    code { font-size: 1.1em; }
+    body { max-width: 64rem; margin: 2rem auto; padding: 0 1rem; line-height: 1.5; }
+    header { display: flex; justify-content: space-between; align-items: center; gap: 1rem; flex-wrap: wrap; }
+    form { display: flex; gap: .5rem; flex-wrap: wrap; }
+    svg { width: 100%; height: auto; }
+    .s0 { fill: #2e9e5b; } .s1 { fill: #d9a400; } .s2 { fill: #888; opacity: .5; }
+    .legend span::before { content: '■ '; } .legend .s0 { color: #2e9e5b; } .legend .s1 { color: #d9a400; } .legend .s2 { color: #888; }
+    small { color: GrayText; }
   </style>
 </head>
 <body>
-  <h1>It runs.</h1>
-  <p>Message from the database: <code id="msg">…</code></p>
-  <p>Served by api replica: <code id="replica">…</code></p>
-  <p>Run <code>docker compose up -d --scale api=3</code> and watch the replica change.</p>
+  <header>
+    <h1 id="title">Seat map</h1>
+    <div id="account">
+      <form id="auth">
+        <input name="email" type="email" aria-label="Email" placeholder="email" autocomplete="username" required>
+        <input name="password" type="password" aria-label="Password" placeholder="password (8+ chars)" minlength="8" autocomplete="current-password" required>
+        <button value="login">Log in</button>
+        <button value="register">Sign up</button>
+      </form>
+    </div>
+  </header>
+  <p id="error" role="alert"></p>
+  <p class="legend"><span class="s0">available</span> <span class="s1">held</span> <span class="s2">sold</span>
+    <small id="stats"></small></p>
+  <svg id="map" role="img" aria-label="Seat map"></svg>
   <script>
-    async function tick() {
-      try {
-        const r = await fetch('/api/hello');
-        const body = await r.json();
-        document.getElementById('msg').textContent = body.message ?? '(no rows, run: docker compose run --rm seed)';
-        document.getElementById('replica').textContent = body.replica;
-      } catch {
-        document.getElementById('replica').textContent = 'api unreachable';
-      }
+    const $ = (id) => document.getElementById(id);
+    const STATUS = ['available', 'held', 'sold'];
+    async function getJson(url) {
+      const r = await fetch(url);
+      if (!r.ok) throw new Error(`${url} returned ${r.status}`);
+      return r.json();
     }
-    tick();
-    setInterval(tick, 1000);
+    const SEAT = 10, PER_ROW = 50, ROWS = 25, GAP = 30; // seed layout: sections side by side in a 2x2 grid
+
+    async function showAccount() {
+      const r = await fetch('/api/me');
+      if (!r.ok) return;
+      const me = await r.json();
+      $('account').innerHTML = `<span>Signed in (${me.role})</span> <button id="logout">Log out</button>`;
+      $('logout').onclick = async () => { await fetch('/api/logout', { method: 'POST' }); location.reload(); };
+    }
+
+    $('auth').onsubmit = async (e) => {
+      e.preventDefault();
+      const body = Object.fromEntries(new FormData(e.target));
+      const r = await fetch(`/api/${e.submitter.value}`, {
+        method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body),
+      });
+      $('error').textContent = r.ok ? '' : (await r.json()).error;
+      if (r.ok) showAccount();
+    };
+
+    async function drawSeats() {
+      // ponytail: ?event=N, default 1 (the seeded one), so both requests go out together. Add an event list page when there are several.
+      const id = Number(new URLSearchParams(location.search).get('event') ?? 1);
+      const [events, { seats }] = await Promise.all([getJson('/api/events'), getJson(`/api/seats?event=${id}`)]);
+      const event = events.find((e) => Number(e.id) === id);
+      if (!event) { $('error').textContent = 'No such event. To load the demo one, run: docker compose run --rm seed'; return; }
+      $('title').textContent = event.name;
+      const w = PER_ROW * SEAT, h = ROWS * SEAT;
+      // ponytail: one <rect> per seat, rebuilt from a string. Fine at 5,000; switch to <canvas> past ~50,000.
+      let svg = '';
+      for (const [n, [, section, row, num, , s]] of seats.entries()) {
+        const i = section.charCodeAt(0) - 65;
+        const x = (i % 2) * (w + GAP) + (num - 1) * SEAT, y = Math.floor(i / 2) * (h + GAP) + (row - 1) * SEAT;
+        svg += `<rect x="${x}" y="${y}" width="8" height="8" class="s${s}" data-n="${n}"></rect>`;
+      }
+      // Tooltips are created on hover: 5,000 eager <title> nodes doubled the render time.
+      $('map').onpointerover = ({ target }) => {
+        if (target.tagName !== 'rect' || target.firstChild) return;
+        const [, section, row, num, price, s] = seats[target.dataset.n];
+        const title = document.createElementNS('http://www.w3.org/2000/svg', 'title');
+        title.textContent = `${section}${row}-${num} $${price / 100} ${STATUS[s]}`;
+        target.append(title);
+      };
+      $('map').setAttribute('viewBox', `0 0 ${2 * w + GAP} ${2 * h + GAP}`);
+      $('map').innerHTML = svg;
+      const free = seats.filter((s) => s[5] === 0).length;
+      // A task queued from the next frame runs after that frame is painted, so this is navigation start to pixels.
+      requestAnimationFrame(() => setTimeout(() => {
+        const ms = Math.round(performance.now());
+        $('map').dataset.ms = ms;
+        $('stats').textContent = `${seats.length} seats, ${free} available, loaded in ${ms} ms`;
+      }));
+    }
+
+    showAccount();
+    drawSeats().catch((err) => { $('error').textContent = `Could not load the seat map (${err.message})`; });
   </script>
 </body>
 </html>
