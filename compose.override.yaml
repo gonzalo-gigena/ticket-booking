@@ -4,3 +4,11 @@ services:
     command: ["node", "--watch", "src/server.js"]
     environment:
       NODE_ENV: development
+
+  worker:
+    command: ["node", "--watch", "src/worker.js"]
+    develop:
+      watch:
+        - action: sync
+          path: ./apps/api/src
+          target: /app/src
