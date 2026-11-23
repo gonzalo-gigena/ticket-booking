@@ -186,6 +186,12 @@ Building the JSON in Postgres with `json_agg` would save about 5 ms of that. It 
 COMPOSE_FILE=compose.yaml docker compose --profile loadtest run --rm -e "URL_PATH=/api/seats?event=1" k6 run /scripts/main.js
 ```
 
+### Measured: hold_race (no seat held twice)
+
+1,000 logged-in clients race for 100 seats through Caddy to 3 api replicas. Each asks for 1–4 random seats and, on a 409, drops the seats it was told are taken and tries again. On a GitHub Actions runner (4 vCPUs): **38,262 hold requests in 33.7 s (1,135/s), 56 holds, exactly 100 seats held, 0 seats claimed twice**, checked with SQL. Run in CI on every push (`src/holds.integration.test.js`).
+
+Migration 000003 applied under k6 load while both api replicas were replaced: 0 failed out of 197,140 requests (4,928 req/s).
+
 ### Measured: the skeleton
 
 The Phase 0 baseline: k6 with 20 virtual users for 20 s against `GET /api/hello`, which reads one row from Postgres through Caddy. Run on an Apple M1 laptop with 8 CPUs and 8 GB given to Docker, with the dev override left out:
