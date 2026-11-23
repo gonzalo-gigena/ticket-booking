@@ -14,3 +14,8 @@ services:
     pull_policy: always
     environment:
       COOKIE_SECURE: "true"
+
+  worker:
+    build: !reset null
+    image: ghcr.io/${IMAGE_REPO:?set IMAGE_REPO=owner/repo}/api:${TAG:-latest}
+    pull_policy: always

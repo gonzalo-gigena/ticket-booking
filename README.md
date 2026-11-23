@@ -4,7 +4,7 @@ Thousands of buyers compete for a fixed number of seats, and no seat is ever sol
 
 The step-by-step build plan is in [PLAN.md](PLAN.md).
 
-> **Status:** Phase 1. Accounts, one seeded event and a 5,000-seat map work. Holds, payments and the waiting room aren't built yet.
+> **Status:** Phase 2. Accounts, a 5,000-seat map and 10-minute holds work, with seats or general admission, and no seat can be held twice. Payments and the waiting room aren't built yet.
 
 ## Run it
 
@@ -35,7 +35,9 @@ The seat map is empty until you seed it: `docker compose run --rm seed`.
 | Load test at 1, 2, 4 replicas | `sh common/scripts/scale.sh` |
 | Metrics (Prometheus) | `docker compose --profile observability up -d`, then http://localhost:9090 |
 | Unit tests | `docker run --rm -v "$PWD/apps/api:/app" -w /app node:26.13-bookworm-slim node --test` |
-| Integration tests (auth and seat map, through Caddy against real Postgres and Redis) | `docker compose --profile tools run --rm api-test` |
+| Integration tests (auth, seat map, holds and the 1,000-client `hold_race`, through Caddy, asserted with SQL) | `docker compose --profile tools run --rm api-test` |
+| Lint migrations for the lock rules | `sh common/scripts/check-migrations.sh` |
+| Apply pending migrations under load, rolling the api | `sh common/scripts/migrate-under-load.sh` |
 | New migration | add `infra/db/migrations/00000N_name.up.sql` + `.down.sql`, restart |
 | Update shared code | `git submodule update --remote common` |
 | Reset everything | `docker compose down -v` |
@@ -59,6 +61,7 @@ Full reference: [`common/README.md`](common/README.md).
 | `GET /api/me` | The session's user ID and role, or 401. |
 | `GET /api/events` | Public, cached for 1.5 s. |
 | `GET /api/seats?event=1` | Public, cached for 1.5 s. Each seat is `[id, section, row, number, price_cents, status]`, status 0 available, 1 held, 2 sold. |
+| `POST /api/holds` | Logged in. `{event_id, seat_ids}` (1–8 seats) or, for general admission, `{event_id, quantity}` (1–8). 201 with the hold ID and `expires_at` (10 min). 409 with `taken` seat IDs, when tickets run out, or when the user already has an active hold for the event. |
 
 ## Architecture
 
@@ -69,7 +72,7 @@ flowchart LR
     caddy["Caddy :8080"]
     web["web<br/>Next.js"]
     api["api ×N<br/>holds, orders, webhooks"]
-    worker["worker ×N<br/>expiry, refunds, email"]
+    worker["worker ×N<br/>hold sweep; later refunds, email"]
     redis[("Redis<br/>sessions, seat cache")]
     bouncer["PgBouncer"]
     db[("Postgres<br/>seats, holds, orders")]
@@ -86,9 +89,9 @@ flowchart LR
   api -->|"sessions, cache"| redis
   api -.->|"create checkout"| pay
   pay -.->|"signed webhook"| api
-  worker -.-> db
+  worker --> db
   worker -.-> mail
-  class web,worker,bouncer planned
+  class web,bouncer planned
   classDef planned stroke-dasharray: 5 5
 ```
 
@@ -122,7 +125,10 @@ profile. Caddy gets TLS automatically. CI pushes multi-arch images to GHCR on ev
 |---|---|---|---|
 | Preventing double booking | `SELECT … FOR UPDATE` on the seat rows, in seat order, in one transaction | Redis locks, or optimistic version checks with retries | The database that records the sale also enforces it, so there's no gap between two systems. Locking in a fixed order means overlapping holds can't deadlock. Cost: hot sections contend on the same rows. |
 | Last line of defense | Partial unique index on `order_items (event_id, seat_id) WHERE status = 'paid'` | Trusting the app code | Even a bug can't sell a seat twice, and a refunded seat can still be sold again. |
-| Hold expiry | Lazy: the hold query treats an expired hold as free. A sweeper tidies up every 30 s. | A timer per hold, or Redis key expiry | There's no timer to lose on a restart, and correctness never depends on the sweeper running. |
+| Hold expiry | Lazy: the hold query treats an expired hold as free. The `worker` sweeps every 30 s. | A timer per hold, or Redis key expiry | There's no timer to lose on a restart, and seats never depend on the sweeper running. General admission does: its counter only gets expired tickets back when the sweep runs, or when the same user holds again. The seat map already shows expired holds as free, so the sweep pushes nothing until Phase 5. |
+| One active hold per user per event | `UNIQUE (user_id, event_id)` on `holds`, `INSERT … ON CONFLICT DO NOTHING`, after deleting that user's expired hold in the same transaction | Checking in app code first | Two simultaneous requests from one user can't both win: the second waits on the unique key and gets nothing. With the 8-per-hold cap, that also caps each user at 8 per event. |
+| General admission | `UPDATE inventory SET remaining = remaining - $n WHERE … AND remaining >= $n`, plus `CHECK (remaining >= 0)` | A row per ticket | One statement, no lock ordering to get right. Cost: the single row is the hot spot for that event. |
+| Caddy → api keep-alive | api `keepAliveTimeout` 130 s, longer than Caddy's 2 min | Node's 5 s default | At 5 s, Caddy reused sockets Node had just closed. Its passive health check then marked every replica down for 10 s, and `hold_race` got 503s. |
 | Payments | Hosted checkout and a signed webhook. Idempotency key = hold ID. Webhooks stored with `UNIQUE (provider, event_id)` and processed by the worker | Taking card details in our own form, or processing webhooks inline | Card data never touches the app. Double clicks and webhook replays are no-ops. Answering 200 fast stops provider retries from piling up. |
 | Payment after the hold expired | Take the seats if they're still free, otherwise refund automatically and email the buyer | Rejecting the webhook | The money already moved, and rejecting the webhook doesn't give it back. Pending orders are also polled, because webhooks get lost. |
 | Traffic spikes | A waiting room: a Redis sorted set, and an admitter that lets N users/s through with single-use tokens | Autoscaling into the spike | The bottleneck is seat-row locks, not api CPU, so more replicas would just queue on Postgres. Cost: Redis needs AOF on, so a restart mid-sale doesn't empty the queue. |

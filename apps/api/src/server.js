@@ -6,6 +6,7 @@ import { createClient } from 'redis';
 import { observe, render } from './metrics.js';
 import { hashPassword, verifyPassword, DUMMY_HASH, newSessionToken, sessionKey, parseCookies, validCredentials } from './auth.js';
 import { eventsJson, seatMapJson } from './seats.js';
+import { parseHold, createHold, MAX_PER_HOLD } from './holds.js';
 
 function env(name, fallback) {
   const value = process.env[name] ?? fallback;
@@ -124,6 +125,14 @@ const routes = {
     if (!Number.isSafeInteger(eventId) || eventId <= 0) return [400, { error: 'event must be a positive integer' }];
     return [200, await seatMapJson(pool, redis, eventId)];
   },
+
+  'POST /api/holds': async ({ req }) => {
+    const user = await currentUser(req);
+    if (!user) return [401, { error: 'not logged in' }];
+    const hold = parseHold(await readJson(req));
+    if (!hold) return [400, { error: `event_id and either 1-${MAX_PER_HOLD} distinct seat_ids or a quantity of 1-${MAX_PER_HOLD} required` }];
+    return createHold(pool, user.id, hold);
+  },
 };
 
 const server = http.createServer(async (req, res) => {
@@ -157,6 +166,11 @@ const server = http.createServer(async (req, res) => {
   observe(routes[key] ? key : 'unmatched', status, seconds); // fixed label set, no cardinality blow-up
   if (!path.endsWith('z')) log('info', 'request', { requestId, method: req.method, path, status, ms: Math.round(seconds * 1000) });
 });
+
+// Outlive Caddy's idle upstream connections (2 min). With Node's 5 s default, Caddy reuses a socket Node just
+// closed, gets "server closed idle connection", and its passive health check marks the replica down for 10 s.
+server.keepAliveTimeout = 130_000;
+server.headersTimeout = 131_000;
 
 function shutdown(signal) {
   if (draining) return;

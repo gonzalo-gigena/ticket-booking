@@ -13,9 +13,11 @@ jobs:
         with:
           submodules: true # common/ (portfolio-common must be public, same owner)
       - run: cp .env.example .env
+      - name: Migrations follow the lock rules
+        run: sh common/scripts/check-migrations.sh
       - name: Unit tests
         run: docker run --rm -v "$PWD/apps/api:/app" -w /app node:26.13-bookworm-slim node --test
-      - name: Integration tests (auth, seat map) on 3 api replicas
+      - name: Integration tests (auth, seat map, holds, hold_race) on 3 api replicas
         run: |
           c="docker compose -f compose.yaml"
           $c up -d --wait --build --scale api=3 || { $c logs; exit 1; }
@@ -23,6 +25,17 @@ jobs:
           # --no-deps: otherwise `run` restarts the api at its default scale of 1
           $c --profile tools run --rm --no-deps -e MIN_REPLICAS=3 api-test || { $c logs api; exit 1; }
           $c --profile "*" down -v --remove-orphans # "*": every profile, so seed and the fakes go too
+      # Start one migration back, then apply the newest one and roll the replicas while k6 runs.
+      - name: Newest migration under load, zero failed requests
+        env:
+          COMPOSE_FILE: compose.yaml
+          DURATION: 40s
+        run: |
+          set -a; . ./.env; set +a
+          docker compose up -d --wait --build --scale api=2 || { docker compose logs; exit 1; }
+          docker compose run --rm migrate -path=/migrations -database "postgres://$POSTGRES_USER:$POSTGRES_PASSWORD@db:5432/$POSTGRES_DB?sslmode=disable" down 1
+          sh common/scripts/migrate-under-load.sh || { docker compose logs api caddy | tail -50; exit 1; }
+          docker compose --profile "*" down -v --remove-orphans
       - name: Stack with 3 api replicas + smoke test
         run: sh common/scripts/ci-stack.sh 3
 
