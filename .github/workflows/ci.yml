@@ -15,6 +15,14 @@ jobs:
       - run: cp .env.example .env
       - name: Unit tests
         run: docker run --rm -v "$PWD/apps/api:/app" -w /app node:26.13-bookworm-slim node --test
+      - name: Integration tests (auth, seat map) on 3 api replicas
+        run: |
+          c="docker compose -f compose.yaml"
+          $c up -d --wait --build --scale api=3 || { $c logs; exit 1; }
+          $c run --rm seed
+          # --no-deps: otherwise `run` restarts the api at its default scale of 1
+          $c --profile tools run --rm --no-deps -e MIN_REPLICAS=3 api-test || { $c logs api; exit 1; }
+          $c --profile "*" down -v --remove-orphans # "*": every profile, so seed and the fakes go too
       - name: Stack with 3 api replicas + smoke test
         run: sh common/scripts/ci-stack.sh 3
 

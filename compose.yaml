@@ -107,6 +107,23 @@ services:
       migrate:
         condition: service_completed_successfully
 
+  # Integration tests through Caddy against real Postgres and Redis (seeds first):
+  # docker compose --profile tools run --rm api-test
+  api-test:
+    image: node:26.13-bookworm-slim
+    profiles: [tools]
+    working_dir: /app
+    volumes:
+      - ./apps/api:/app:ro
+    command: ["node", "--test", "src/api.integration.test.js"]
+    environment:
+      BASE_URL: http://caddy:8080
+    depends_on:
+      seed:
+        condition: service_completed_successfully
+      caddy:
+        condition: service_started
+
   # sh common/scripts/scale.sh, or: docker compose --profile loadtest run --rm k6 run /scripts/main.js
   k6:
     image: grafana/k6:2.4.0

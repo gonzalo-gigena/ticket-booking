@@ -35,6 +35,7 @@ The seat map is empty until you seed it: `docker compose run --rm seed`.
 | Load test at 1, 2, 4 replicas | `sh common/scripts/scale.sh` |
 | Metrics (Prometheus) | `docker compose --profile observability up -d`, then http://localhost:9090 |
 | Unit tests | `docker run --rm -v "$PWD/apps/api:/app" -w /app node:26.13-bookworm-slim node --test` |
+| Integration tests (auth and seat map, through Caddy against real Postgres and Redis) | `docker compose --profile tools run --rm api-test` |
 | New migration | add `infra/db/migrations/00000N_name.up.sql` + `.down.sql`, restart |
 | Update shared code | `git submodule update --remote common` |
 | Reset everything | `docker compose down -v` |
@@ -138,21 +139,32 @@ Rows for parts that aren't built yet record the plan's choice. Each one gets con
 
 ### Measured: seat map with 5,000 seats (target: under 200 ms)
 
-**p95 is 86–91 ms from the cache and 118–134 ms on a cache miss, with the laptop moderately busy.** That is navigation start to painted seats in headless Chrome 158 on an Apple M1, HTTP cache off, through Caddy to 1 api replica, with no network latency. Each run is 30 loads per row. Other Docker projects shared the machine, so all three runs are shown:
+**On a quiet laptop, p95 is 46–54 ms from the cache and 71–79 ms on a cache miss, and a fresh browser's first load takes 42–124 ms.** That is navigation start to painted seats in headless Chrome 158 on an Apple M1, HTTP cache off, through Caddy to 1 api replica, with no network latency. Each row is 30 loads.
 
-| Run | Load average at start (8 CPUs) | Cache | p50 | p95 | Under 200 ms |
-|---|---|---|---|---|---|
-| 1 | 6.5 | hit | 52 ms | 91 ms | 30/30 |
-| 1 | 6.5 | miss | 79 ms | 118 ms | 30/30 |
-| 2 | 11.4 | hit | 57 ms | 86 ms | 30/30 |
-| 2 | 11.4 | miss | 83 ms | 134 ms | 30/30 |
-| 3 | 10.5, another container at 400% CPU | hit | 53 ms | 76 ms | 30/30 |
-| 3 | 10.5, another container at 400% CPU | miss | 107 ms | **395 ms** | 26/30 |
+```bash
+node infra/loadtest/pageload.mjs http://localhost:8080 30
+```
 
-Where the target is missed:
+The same three runs on four occasions, with different amounts of other Docker work on the machine:
 
-- **The first load in a just-started browser:** 277, 161 and 234 ms in those runs.
-- **An oversubscribed host:** at load average 16–31, misses reached p95 477–526 ms and hits 161–276 ms.
+| Host (8 CPUs) | Cache hit p95 | Cache miss p95 | First load, fresh browser | Under 200 ms |
+|---|---|---|---|---|
+| Quiet: load avg 3–5, no other projects | 46–54 ms | 71–79 ms | 42–124 ms | 180/180 |
+| Moderate: load avg 7–9, 8 other containers | 59–75 ms | 70–111 ms | 89–286 ms | 179/180 |
+| Busy: load avg 6.5–11.4, one container at 400% CPU | 76–91 ms | 118–395 ms | 161–277 ms | 176/180 |
+| Oversubscribed: load avg 16–31 | 161–276 ms | 477–526 ms | 204–1,059 ms | not met |
+
+The target is missed only when other work competes for the CPU. With Chrome's CPU slowed 4× (`CPU_SLOWDOWN=4`, 20 loads per row, two runs at load avg 5–8), misses stayed at p95 168–169 ms. Hits were at p95 132 ms in one run and 383 ms in the other (18/20 under 200).
+
+Where a fresh browser's first load spends its time (5 loads at load avg 9–10, 85–119 ms in total): the HTML arrives at 10–24 ms, and the seats request, a cache miss, takes 42–76 ms. On a miss, the api spends about 26 ms:
+
+| Step on a cache miss | Median |
+|---|---|
+| `pg` turns 5,000 rows into JS objects (Postgres runs the query in 1.5 ms) | 18 ms |
+| Caddy gzips 117 KB down to 25 KB | 5 ms |
+| Packing, `JSON.stringify` and the Redis write | 3 ms |
+
+Building the JSON in Postgres with `json_agg` would save about 5 ms of that. It was rejected: the hold-expiry rule would move out of unit-tested JS into SQL for a few percent of a first load.
 
 `GET /api/seats?event=1` alone (117 KB, 25 KB gzipped):
 
